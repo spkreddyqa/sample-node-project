@@ -1,0 +1,2 @@
+[stageserver]
+172.31.40.95 ansible_user=ec2-user
