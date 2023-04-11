@@ -1,0 +1,473 @@
+/** Function to send Email*/
+def sendEmail(emailSubject, emailBody, recipients, hasAttachment) {
+    print '...........................Sending Email..................................'    
+    if(hasAttachment){
+        emailext (subject: emailSubject, attachmentsPattern: '**/*.txt',  mimeType: 'text/html', body: emailBody, to: recipients);
+    } else {
+        emailext (subject: emailSubject, mimeType: 'text/html', body: emailBody, to: recipients);
+    }
+}
+def Docker_TAG
+
+pipeline{
+    agent any
+   
+    tools {
+	  nodejs 'nodejs14.20.0'
+          maven 'maven 3.8.5'
+    }
+    
+    environment {
+	  stage_status = "Failure"
+      test_status = "Failure"
+      uat_status = "Failure"
+	  pod_status = "Failure"
+	  
+    }
+    stages {
+
+    stage("checkout") {
+        steps{
+            script {
+                git url: 'https://github.com/nrBaskar/sample-node-project.git', 
+				branch: 'master'
+                Docker_TAG = getversion()
+            }
+        }
+    }
+    stage("last-changes") {
+        steps{
+            script{
+                env.GIT_COMMIT_AUTHOR = sh(returnStdout: true, script: 'git log -3 --format="%ae"').trim()
+                env.GIT_COMMIT_ID = sh(returnStdout: true, script: 'git log -3 --format="%h"').trim()
+                env.GIT_COMMIT_DATE = sh(returnStdout: true, script: 'git log -3 --graph --pretty=format:"%cd"').trim()
+                         
+                def diff = sh(returnStdout: true, script: 'git show -n 3')
+                sh(returnStdout: true, script: 'cd /var/lib/jenkins/workspace/')
+                env.SourcePATH = sh(returnStdout: true, script: 'pwd')
+                diff += "SOURCE PATH: "+env.SourcePATH
+                
+                writeFile file: 'build.txt', text: diff    
+            }
+        }       
+    }
+    stage('Build'){
+        steps{
+			
+		sh "mvn clean package"
+       }
+    }
+    stage('Docker Build'){
+        steps{
+			dockerstatus()
+            sh "docker build . -t nrbaskar/hariapp:${Docker_TAG}"   
+        }
+    }
+    stage('Dockerhub Push'){
+        steps{
+        
+            withCredentials([string(credentialsId: 'docker-hub', variable: 'dockerHubPwd')]) {
+                sh "docker login -u nrbaskar -p ${dockerHubPwd}"
+            }
+            
+            sh "docker push nrbaskar/hariapp:${Docker_TAG}"
+        }
+    }
+	
+	stage('Staging server'){
+        steps{
+            script{
+                ansiblePlaybook(
+                    becomeUser: null, 
+                    colorized: false,
+                    installation: 'ansible',
+                    credentialsId: 'staging_server',
+                    disableHostKeyChecking: true,
+                    forks: 50,
+                    hostKeyChecking: false,
+                    inventory: 'dev.inv',
+                    playbook: 'Staging_Node.yml', 
+                    sudoUser: null,
+                    extras: "-e DOCKER_TAG=${Docker_TAG}"
+                ) //ansiblePlaybook
+                env.staging_logs = getOutputLogs()
+            }
+            
+        }
+    }
+    stage('Stage Deploy'){
+        steps{
+            script{
+                //Stage Server Logs
+                // Match (ok=) word in logs using Regex pattern
+                def stage_matches = env.staging_logs =~ /(?=[ ]*:[ ]*ok=([1-9]|[1-9][0-9]))/
+                def stage_res = stage_matches[0]
+                
+                if(stage_res[1] > 0){
+                    stage_status = "Success"
+                }
+            }
+        }
+    }
+    stage('Testing server'){
+         steps{
+            script{
+                ansiblePlaybook(
+                    becomeUser: null, 
+                    colorized: false,
+                    installation: 'ansible',
+                    credentialsId: 'testing-server',
+                    disableHostKeyChecking: true,
+                    forks: 50,
+                    hostKeyChecking: false,
+                    inventory: 'test.inv',
+                    playbook: 'deploy_test.yml', 
+                    sudoUser: null,
+                    extras: "-e DOCKER_TAG=${Docker_TAG}"
+                ) //ansiblePlaybook
+                env.testing_log = getOutputLogs()
+            }        
+        }
+    }
+    stage('Test Deploy'){
+        steps{
+            script{
+                //Test Server Logs
+                // Match (ok=) word in logs using Regex pattern
+                def test_matches = env.testing_log =~ /(?=[ ]*:[ ]*ok=([1-9]|[1-9][0-9]))/
+                def test_res = test_matches[0]
+                
+                if(test_res[1] > 0){
+                    test_status = "Success"
+                }
+            }
+        }
+    }
+    stage('Uat server'){
+         steps{
+            script{
+                //Trigger Approval Mail to the Approver
+                ApprovalNotification('UAT')
+                //Get Approval Process the Deployment
+                ansiblePlaybook(
+                    becomeUser: null, 
+                    colorized: false,
+                    installation: 'ansible',
+                    credentialsId: 'uat1-server',
+                    disableHostKeyChecking: true,
+                    forks: 50,
+                    hostKeyChecking: false,
+                    inventory: 'uat.inv',
+                    playbook: 'deploy_uat.yml', 
+                    sudoUser: null,
+                    extras: "-e DOCKER_TAG=${Docker_TAG}"
+                ) //ansiblePlaybook
+                env.uat_log = getOutputLogs()
+            }        
+        }
+    }
+    stage('Uat Deploy'){
+        steps{
+            script{
+                //uat Server Logs
+                // Match (ok=) word in logs using Regex pattern
+                def uat_matches = env.uat_log =~ /(?=[ ]*:[ ]*ok=([1-9]|[1-9][0-9]))/
+                def uat_res = uat_matches[0]
+                
+                if(uat_res[1] > 0){
+                    uat_status = "Success"
+                }
+            }
+        }
+    }
+	stage('pod server'){
+		steps {
+         script{
+                //Trigger Approval Mail to the Approver
+                ApprovalNotification('PRODUCTION')
+                //Get Approval Process to Deployment
+                ansiblePlaybook(
+                    becomeUser: null, 
+                    colorized: false,
+                    installation: 'ansible',
+                    credentialsId: 'pod-server',
+                    disableHostKeyChecking: true,
+                    forks: 50,
+                    hostKeyChecking: false,
+                    inventory: 'pod.inv',
+                    playbook: 'deploy-pod.yml', 
+                    sudoUser: null,
+                    extras: "-e DOCKER_TAG=${Docker_TAG}"
+                ) //ansiblePlaybook
+                env.pod_log = getOutputLogs()
+            }  
+		}
+    }
+    stage('Production Deploy'){
+        steps{
+            script{
+                //Production Server Logs
+                // Match (ok=) word in logs using Regex pattern
+                def pod_matches = env.pod_log =~ /(?=[ ]*:[ ]*ok=([1-9]|[1-9][0-9]))/
+                def pod_res = pod_matches[0]
+                
+                if(pod_res[1] > 0){
+                    pod_status = "Success"
+                }
+            }
+        }
+    }
+}
+  post {
+        success{
+            script{                
+                DeployNotification()
+            }
+        } //success
+        failure {
+            script {
+				if(stage_status != "Success"){
+                    env.staging_logs  = getErrorLogs()
+				}
+                if(test_status != "Success"){
+                    env.testing_log  = getErrorLogs()
+                }
+                if(uat_status != "Success"){
+                    env.uat_log  = getErrorLogs()
+                }
+				if(pod_status != "Success"){
+                    env.pod_log  = getErrorLogs()
+                }
+				DeployNotification()
+            } //script
+        } //failure
+        aborted{
+            script{  
+                if(test_status != "Success"){
+                    RejectedBuildNotification('TESTING')
+                }else if(uat_status != "Success"){
+                    RejectedBuildNotification('UAT')
+				}else if(pod_status != "Success"){
+                    RejectedBuildNotification('PRODUCTION')
+                }              
+            } //script
+        } //aborted
+    } //post
+} //Pipeline
+
+def getversion(){
+
+    def commithash = sh(returnStdout: true, script: 'git rev-parse --short HEAD')
+    echo commithash
+    return commithash
+    
+}
+def dockerstatus() {
+	 // sh "run npm"
+     sh "sudo service docker start"
+     sh "sudo chmod 777 /var/run/docker.sock"
+}
+
+//Send Approval Email Notification
+def ApprovalNotification(ServerID) {
+
+    def emailSubject = "Jenkins Notification: Build Approval for  ${ServerID} Deployment Build ID #${BUILD_NUMBER}";
+    def emailBody = """
+    <p>Hi UAT Team,</p>
+    <strong>"${ServerID} Deployment for Build ID #${BUILD_NUMBER} is waiting for your Approval"</strong>
+    <p>A build has been initiated in the UAT. We will let you know once the deployment is successful.</p>
+    <p>To browse Jenkins URL: <a href="http://44.206.242.39:8080/">Click here to Approve / Reject </a></p>
+	<p>Commit Id: <b>${env.GIT_COMMIT_ID}</b></p>
+    <p>Source Path: <b>${env.SourcePATH}</b></p>
+    <p>Author: ${env.GIT_COMMIT_AUTHOR}</p>
+    <p>Date: ${env.GIT_COMMIT_DATE}</p>
+    
+    <p>With Regards,</p>
+    <p>Sify Jenkins Admin</p>"""
+
+    def recipients = APPROVER
+    sendEmail(emailSubject, emailBody, recipients, true);
+    //Waiting for the Approval
+    def userInput = input(  id: 'Proceed', message: "Deploy to ${ServerID}?", parameters: [
+    [$class: 'BooleanParameterDefinition', defaultValue: true, description: '', name: 'Proceed with deployment?']])
+}
+
+//Build Reject Email Notification
+def RejectedBuildNotification(ServerID){
+
+    def emailSubject = "Jenkins Notification: Build Rejected for ${ServerID} Server Build ID #${BUILD_NUMBER}";
+    
+    def emailBody = """
+    <p>Hi Devops Team,</p>
+    <p>Jenkins File Deployment Process for ${ServerID} Server is Rejected
+    <p>Please find the last commit details below:</p>
+	<p>Commit Id: <b>${env.GIT_COMMIT_ID}</b></p>
+    <p>Source Path: <b> ${env.SourcePATH}</b></p>
+    <p>Author: ${env.GIT_COMMIT_AUTHOR}</p>
+    <p>Date: ${env.GIT_COMMIT_DATE}</p>
+		
+    <p>With Regards,</p>
+    <p>Sify Jenkins Admin</p>"""
+
+    def recipients = TESTERS
+    sendEmail(emailSubject, emailBody, recipients, true);
+}
+def DeployNotification(){
+
+	if(stage_status != 'Success'){
+
+        def emailSubject = "Jenkins Notification: Staging file deployment for ${env.JOB_NAME} - Failure, Build ID : ${BUILD_NUMBER}";
+        def emailBody = """
+        <p>Hi Staging Dev Team,</p>
+        <strong>Staging File Deployment Process for ${env.JOB_NAME} is Failure. Kindly check the logs below for more details</strong>
+        <p>Please find the last commit details below:</p>
+        <p>See attached diff of <b>${env.JOB_NAME} #${BUILD_NUMBER}</b>.</p>
+        <p>Commit Id: <b>${env.GIT_COMMIT_ID}</b></p>
+        <p>Source Path: <b> ${env.SourcePATH}</b></p>
+        <p>Author: ${env.GIT_COMMIT_AUTHOR}</p>
+        <p>Date: ${env.GIT_COMMIT_DATE}</p>
+        <p>Staging Deployment- <b>${stage_status}</b></p>
+        <p>${env.staging_logs}</p><br>
+     
+        <p>With Regards,</p>
+        <p>Sify Jenkins Admin</p>"""
+
+        def recipients = TESTERS
+        sendEmail(emailSubject, emailBody, recipients, true);
+		
+    }else if(test_status != 'Success'){
+
+        def emailSubject = "Jenkins Notification: Testing file deployment for ${env.JOB_NAME} - Failure, Build ID : ${BUILD_NUMBER}";
+        
+        def emailBody = """
+        <p>Hi Devops Team,</p>
+        <p>Testing File Deployment Process for ${env.JOB_NAME} is Failure. Kindly check the logs below for more details 
+        <p>Please find the last commit details below:</p>
+        <p>See attached diff of <b>${env.JOB_NAME} #${BUILD_NUMBER}</b>.</p>
+        <p>Commit Id: <b>${env.GIT_COMMIT_ID}</b></p>
+        <p>Source Path: <b>${env.SourcePATH}</b></p>
+        <p>Author: ${env.GIT_COMMIT_AUTHOR}</p>
+        <p>Date: ${env.GIT_COMMIT_DATE}</p>
+		<p>Staging URL - http://54.227.16.102:8083/webapp/index.jsp </b></p>
+        <p>${env.staging_logs}</p><br>
+        <p>Testing Deployment- <b>${test_status}</b></p>
+        <p>${env.testing_log}</p><br> 
+        <p>With Regards,</p>
+        <p>Sify Jenkins Admin</p>"""
+
+        def recipients = TESTERS
+        sendEmail(emailSubject, emailBody, recipients, true);
+		
+    }else if(uat_status != 'Success'){
+
+        def emailSubject = "Jenkins Notification: UAT file deployment for ${env.JOB_NAME} - Failure, Build ID : ${BUILD_NUMBER}";
+        
+        def emailBody = """
+        <p>Hi Devops Team,</p>
+        <storng>UAT File Deployment Process for ${env.JOB_NAME} is Failure. Kindly check the logs below for more details</strong> 
+        <p>Please find the last commit details below:</p>
+        <p>See attached diff of <b>${env.JOB_NAME} #${BUILD_NUMBER}</b>.</p>
+        <p>Commit Id: <b>${env.GIT_COMMIT_ID}</b></p>
+        <p>Source Path: <b>${env.SourcePATH}</b></p>
+        <p>Author: ${env.GIT_COMMIT_AUTHOR}</p>
+        <p>Date: ${env.GIT_COMMIT_DATE}</p>
+		<p>Staging Deployment- <b>${stage_status}</b></p>
+		<p>Staging URL - http://54.227.16.102:8083/webapp/index.jsp </b></p>
+        <p>${env.staging_logs}</p><br>
+        <p>Testing Deployment- <b>${test_status}</b></p>
+		<p>Testing URL - http://34.229.0.210:8085/webapp/index.jsp </b></p>
+        <p>${env.testing_log}</p><br> 
+        <p>UAT Deployment- <b>${uat_status}</b></p>
+        <p>${env.uat_log}</p><br> 
+        <p>With Regards,</p>
+        <p>Sify Jenkins Admin</p>"""
+
+        def recipients = TESTERS
+        sendEmail(emailSubject, emailBody, recipients, true);
+		
+	}else if(pod_status != 'Success'){
+		
+		def emailSubject = "Jenkins Notification: Production file deployment for ${env.JOB_NAME} - Failure, Build ID : ${BUILD_NUMBER}";
+        
+        def emailBody = """
+        <p>Hi Devops Team,</p>
+        <strong>Production File Deployment Process for ${env.JOB_NAME} is Failure. Kindly check the logs below for more details</strong>
+        <p>Please find the last commit details below:</p>
+        <p>See attached diff of <b>${env.JOB_NAME} #${BUILD_NUMBER}</b>.</p>
+        <p>Commit Id: <b>${env.GIT_COMMIT_ID}</b></p>
+        <p>Source Path: <b>${env.SourcePATH}</b></p>
+        <p>Author: ${env.GIT_COMMIT_AUTHOR}</p>
+        <p>Date: ${env.GIT_COMMIT_DATE}</p>
+		<p>Staging Deployment- <b>${stage_status}</b></p>
+		<p>Staging URL - http://54.227.16.102:8083/webapp/index.jsp </b></p>
+        <p>${env.staging_logs}</p><br>
+        <p>Testing Deployment- <b>${test_status}</b></p>
+		<p>Testing URL - http://34.229.0.210:8085/webapp/index.jsp </b></p>
+        <p>${env.testing_log}</p><br> 
+        <p>UAT Deployment- <b>${uat_status}</b></p>
+		<p>UAT URL - http://34.229.0.210:8085/webapp/index.jsp </b></p
+        <p>${env.uat_log}</p><br>
+		<p>Production Deployment- <b>${pod_status}</b></p>
+        <p>${env.pod_log}</p><br> 
+        <p>With Regards,</p>
+        <p>Sify Jenkins Admin</p>"""
+
+        def recipients = TESTERS
+        sendEmail(emailSubject, emailBody, recipients, true);
+		
+	}else{
+        
+        def emailSubject = "Jenkins Notification: Production file deployment for ${env.JOB_NAME} - Success, Build ID : #${BUILD_NUMBER}";
+
+        def emailBody = """
+        <p>Hi Devops Team,</p>
+        <strong>Production File Deployment Process for ${env.JOB_NAME} is Success. Kindly check the logs below for more details</strong> 
+        <p>Please find the last commit details below:</p>
+        <p>See attached diff of <b>${env.JOB_NAME} #${BUILD_NUMBER}</b>.</p>
+        <p>Commit Id: <b>${env.GIT_COMMIT_ID}</b></p>
+        <p>Source Path: <b>${env.SourcePATH}</b></p>
+        <p>Author: ${env.GIT_COMMIT_AUTHOR}</p>
+        <p>Date: ${env.GIT_COMMIT_DATE}</p>
+        
+		<p>Production Deployment- <b>${pod_status}</b></p>
+		<p>${env.pod_log}</p><br>
+        <p>With Regards,</p>
+        <p>Sify Jenkins Admin</p>"""
+
+        def recipients = TESTERS
+        sendEmail(emailSubject, emailBody, recipients, true);
+    }
+}
+
+def getErrorLogs(){
+    // Get the last 80 lines of the log
+    def log = currentBuild.rawBuild.getLog(80)
+    // Get (PLAY RECAP with Status) String in logs using REGEX pattern
+    def matches = log =~ /([0-9a-zA-Z\.\-]+)(?=[ ]*:[ ](.*)PLAY RECAP(.*))/
+    def errolog = null
+    println(matches[0])
+    if (matches) {
+        for (int i = 0; i < matches.size(); i++) {
+            if (errolog?.trim()) {
+                errolog = errolog + " " + matches[i]
+            } else {
+                errolog = matches[i][0]
+            }
+        } // for
+    }
+    return errolog
+}
+
+def getOutputLogs() {
+    // Get the last 100 lines of the log
+    def log = currentBuild.rawBuild.getLog(100)
+    //Match Output logs using Regex pattern 
+    def matches = log =~ /([0-9a-zA-Z\.\-]+)(?=[ ]*:[ ](.*)PLAY RECAP(.*))/
+    def response = null
+    if (matches) {
+        for (int i = 0; i < matches.size(); i++) {
+            response = matches[i]
+        }
+    } 
+    return response
+}
