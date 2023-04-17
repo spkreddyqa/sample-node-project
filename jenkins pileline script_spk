@@ -1,0 +1,56 @@
+pipeline{
+   agent any
+       tools {
+	     nodejs 'nodejs 19.9.0'
+	   }
+
+
+       stages{
+               stage ('SCM') {
+                      steps{
+                              git credentialsId: 'github', 
+                                             url: 'https://github.com/spkreddyqa/sample-node-project.git',
+                                             branch: 'master'
+                      }
+                      
+
+                }
+                stage ('Get Version'){
+                    steps{
+                        script {
+                            DOCKER_TAG = getversion()
+                        }
+                    }
+                }
+      
+                stage('Docker Build'){
+                      steps{
+                              sh "docker build . -t spkreddy/nodejeapp:${DOCKER_TAG}"
+                      }
+
+                }
+       stage('DockerHub Push'){
+                       steps{
+					   
+                          withCredentials([string(credentialsId: 'docker-hub', variable: 'dockerHubPwd')]) {
+                sh "docker login -u spkreddy -p ${dockerHubPwd}"
+                                             sh "docker push spkreddy/nodejeapp:${DOCKER_TAG}"
+						}
+		}
+      
+	  }	
+        	    stage('Docker Deploy'){
+                      steps{
+                        ansiblePlaybook credentialsId: 'staging_Server', disableHostKeyChecking: true, extras: "-e DOCKER_TAG=${DOCKER_TAG}", installation: 'ansible', inventory: 'dev.inv', playbook: 'node_deploy.yml'
+                             }
+                                                          
+                     }
+		    }	
+        }
+def getversion(){
+
+    def commithash = sh(returnStdout: true, script: 'git rev-parse --short HEAD')
+    echo commithash
+    return commithash
+
+}
